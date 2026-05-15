@@ -33,6 +33,7 @@ extern "C" {
 */
 
 struct _starpu_data_state;
+struct starpu_task;
 
 /**
    StarPU uses ::starpu_data_handle_t as an opaque handle to manage a
@@ -278,6 +279,40 @@ void starpu_data_invalidate(starpu_data_handle_t handle);
    This is the same as starpu_data_deinitialize_submit(), plus explicitly releasing the buffers.
 */
 void starpu_data_invalidate_submit(starpu_data_handle_t handle);
+
+/**
+   Like starpu_data_invalidate_submit(), but the internal acquire uses
+   sequential consistency parameter 0: no implicit data-dependency edges
+   are added for the acquire callback (same branch as when both handle and
+   acquire pass sequential consistency off). The handle is still marked
+   uninitialized like \ref starpu_data_invalidate_submit — copies are
+   released asynchronously and readers must not run until a writer (or
+   initializer) repopulates the handle.
+*/
+void starpu_data_invalidate_submit_no_sequential_consistency(starpu_data_handle_t handle);
+
+/**
+   Submit invalidation of the data \p handle between already-submitted
+   tasks, by creating internal synchronization tasks with explicit task
+   dependencies. The invalidation runs after all tasks listed in
+   \p input_deps complete, and each task listed in \p output_deps will
+   additionally wait for the invalidation to finish.
+
+   Contrary to starpu_data_invalidate_submit(), this does not use the
+   current tail of the handle's sequential-consistency history to place the
+   invalidation. It is meant for schedulers or advanced users that have
+   already built a DAG and need to insert the invalidation at a precise
+   point inside it.
+
+   Contrary to starpu_data_invalidate_submit(), this explicit-dependency
+   variant does not modify the logical initialization state of \p handle.
+   It is intended for schedulers or advanced runtimes that already know the
+   transformed subgraph is correct and only need the invalidation callback to
+   happen between explicit predecessor and successor tasks.
+*/
+int starpu_data_invalidate_submit_with_deps(starpu_data_handle_t handle,
+	unsigned ndeps_input, struct starpu_task *input_deps[],
+	unsigned ndeps_output, struct starpu_task *output_deps[]);
 
 /**
    Specify that the data \p handle can be discarded without impacting

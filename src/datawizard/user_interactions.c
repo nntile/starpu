@@ -25,6 +25,8 @@
 #include <core/dependencies/data_concurrency.h>
 #include <core/sched_policy.h>
 #include <datawizard/memory_nodes.h>
+#include <datawizard/interfaces/data_interface.h>
+#include <starpu_graph_capture.h>
 
 static void _starpu_data_check_initialized(starpu_data_handle_t handle, enum starpu_data_access_mode mode)
 {
@@ -490,6 +492,88 @@ int starpu_data_acquire_on_node_cb(starpu_data_handle_t handle, int node,
 	return starpu_data_acquire_on_node_cb_sequential_consistency(handle, node, mode, callback, arg, 1);
 }
 
+static int _starpu_data_acquire_on_node_cb_with_deps(starpu_data_handle_t handle, int node,
+					enum starpu_data_access_mode mode, void (*callback)(void *), void *arg,
+					unsigned ndeps_input, struct starpu_task *input_deps[],
+					unsigned ndeps_output, struct starpu_task *output_deps[],
+					const char *pre_name, const char *post_name)
+{
+	STARPU_ASSERT(handle);
+	STARPU_ASSERT_MSG(handle->nchildren == 0, "Acquiring a partitioned data (%p) is not possible", handle);
+	_STARPU_LOG_IN();
+
+	/* Check that previous tasks have set a value if needed */
+	_starpu_data_check_initialized(handle, mode);
+
+	struct user_interaction_wrapper *wrapper;
+	_STARPU_MALLOC(wrapper, sizeof(struct user_interaction_wrapper));
+
+	_starpu_data_acquire_wrapper_init(wrapper, handle, node, mode);
+	wrapper->async = 1;
+	wrapper->callback_acquired = NULL;
+	wrapper->callback = callback;
+	wrapper->callback_arg = arg;
+	wrapper->prio = STARPU_DEFAULT_PRIO;
+
+	unsigned sched_ctx_id = starpu_sched_ctx_get_context();
+	if (sched_ctx_id >= (unsigned)STARPU_NMAX_SCHED_CTXS)
+		sched_ctx_id = 0;
+
+	STARPU_PTHREAD_MUTEX_LOCK(&handle->sequential_consistency_mutex);
+	STARPU_ASSERT_MSG(handle->sequential_consistency,
+		"Explicit dependency acquire callbacks require handle sequential consistency");
+
+	wrapper->pre_sync_task = starpu_task_create();
+	wrapper->pre_sync_task->name = pre_name;
+	wrapper->pre_sync_task->detach = 1;
+	wrapper->pre_sync_task->callback_func = starpu_data_acquire_cb_pre_sync_callback;
+	wrapper->pre_sync_task->callback_arg = wrapper;
+	wrapper->pre_sync_task->type = STARPU_TASK_TYPE_DATA_ACQUIRE;
+	wrapper->pre_sync_task->priority = STARPU_DEFAULT_PRIO;
+	wrapper->pre_sync_task->sched_ctx = sched_ctx_id;
+
+	wrapper->post_sync_task = starpu_task_create();
+	wrapper->post_sync_task->name = post_name;
+	wrapper->post_sync_task->detach = 1;
+	wrapper->post_sync_task->type = STARPU_TASK_TYPE_DATA_ACQUIRE;
+	wrapper->post_sync_task->priority = STARPU_DEFAULT_PRIO;
+	wrapper->post_sync_task->sched_ctx = sched_ctx_id;
+
+	STARPU_PTHREAD_MUTEX_UNLOCK(&handle->sequential_consistency_mutex);
+
+	if (ndeps_input)
+		starpu_task_declare_deps_array_relaxed(wrapper->pre_sync_task, ndeps_input, input_deps);
+
+	if (ndeps_output)
+	{
+		unsigned i;
+		for (i = 0; i < ndeps_output; i++)
+		{
+			struct starpu_task *post_dep[1] = { wrapper->post_sync_task };
+			starpu_task_declare_deps_array_relaxed(output_deps[i], 1, post_dep);
+		}
+	}
+
+	int ret = _starpu_task_submit_internally(wrapper->pre_sync_task);
+	STARPU_ASSERT(!ret);
+
+	_STARPU_LOG_OUT();
+	return 0;
+}
+
+int starpu_data_invalidate_submit_with_deps(starpu_data_handle_t handle,
+	unsigned ndeps_input, struct starpu_task *input_deps[],
+	unsigned ndeps_output, struct starpu_task *output_deps[])
+{
+	STARPU_ASSERT(handle);
+
+	return _starpu_data_acquire_on_node_cb_with_deps(handle, STARPU_ACQUIRE_NO_NODE_LOCK_ALL,
+			STARPU_W, _starpu_data_invalidate, handle,
+			ndeps_input, input_deps, ndeps_output, output_deps,
+			"_starpu_data_invalidate_with_deps_pre",
+			"_starpu_data_invalidate_with_deps_post");
+}
+
 int starpu_data_acquire_cb(starpu_data_handle_t handle,
 			   enum starpu_data_access_mode mode, void (*callback)(void *), void *arg)
 {
@@ -940,53 +1024,28 @@ static void _starpu_data_wont_use(void *data)
 	}
 }
 
-#ifdef STARPU_RECURSIVE_TASKS
-#if 0
-static void flush_func(void *buffers[], void *arg)
+void _starpu_data_wont_use_impl(starpu_data_handle_t handle)
 {
-	(void) buffers;
-	(void) arg;
-}
-
-static struct starpu_codelet flush_codelet =
-{
-	.cpu_funcs = {flush_func},
-	.nbuffers = 1
-};
-#endif
-#endif
-
-void starpu_data_wont_use(starpu_data_handle_t handle)
-{
-#ifndef STARPU_RECURSIVE_TASKS
 	if (!handle->initialized)
 		/* No value atm actually */
 		return;
-#endif
 
-#ifdef STARPU_RECURSIVE_TASKS
-//	char *fname;
-//	asprintf(&fname, "Flush(%p)", handle);
-//	starpu_task_insert(&flush_codelet,
-//			   STARPU_RW, handle,
-//			   STARPU_NAME, fname, 0);
-#else
 	if (starpu_data_get_nb_children(handle) != 0)
 	{
 		int i;
 		for(i=0 ; i<starpu_data_get_nb_children(handle) ; i++)
-			starpu_data_wont_use(starpu_data_get_child(handle, i));
+			_starpu_data_wont_use_impl(starpu_data_get_child(handle, i));
 		return;
 	}
 
-	if (handle->nactive_readonly_children != 0)
+	if (handle->partitioned != 0)
 	{
 		unsigned i;
-		for(i=0 ; i<handle->nactive_readonly_children; i++)
+		for(i=0 ; i<handle->partitioned; i++)
 		{
 			unsigned j;
 			for(j=0 ; j<handle->active_readonly_nchildren[i] ; j++)
-				starpu_data_wont_use(handle->active_readonly_children[i][j]);
+				_starpu_data_wont_use_impl(handle->active_readonly_children[i][j]);
 		}
 	}
 
@@ -994,13 +1053,28 @@ void starpu_data_wont_use(starpu_data_handle_t handle)
 	{
 		unsigned j;
 		for(j=0 ; j<handle->active_nchildren ; j++)
-			starpu_data_wont_use(handle->active_children[j]);
+			_starpu_data_wont_use_impl(handle->active_children[j]);
 		return;
 	}
-#endif
 
 	_starpu_trace_data_wont_use(handle);
 	starpu_data_acquire_on_node_cb_sequential_consistency_quick(handle, STARPU_ACQUIRE_NO_NODE_LOCK_ALL, STARPU_R, _starpu_data_wont_use, handle, 1, 1);
+}
+
+void starpu_data_wont_use(starpu_data_handle_t handle)
+{
+	int ret;
+
+	if (!handle->initialized)
+		return;
+
+	ret = _starpu_graph_recorder_try_capture_wont_use(handle);
+	if (ret == 0)
+		return;
+	if (ret > 0)
+		return;
+
+	_starpu_data_wont_use_impl(handle);
 }
 
 /*
